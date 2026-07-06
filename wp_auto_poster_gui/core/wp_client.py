@@ -164,6 +164,8 @@ class WordPressClient:
             payload["categories"] = [self.get_or_create_term("categories", post.category)]
         if post.tags:
             payload["tags"] = [self.get_or_create_term("tags", tag) for tag in post.tags]
+        else:
+            payload["tags"] = []
 
         return payload
 
