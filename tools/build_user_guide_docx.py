@@ -250,7 +250,56 @@ def build_doc() -> None:
         ],
     )
 
-    doc.add_heading("2. Cấu trúc Excel app đang hỗ trợ", level=1)
+    doc.add_heading("2. Kết nối WordPress lần đầu", level=1)
+    add_para(
+        doc,
+        "Trước khi chọn Excel và đăng bài, cần kết nối app với WordPress bằng REST API. "
+        "Thông tin quan trọng nhất là URL phải đúng định dạng và password phải là Application Password.",
+    )
+    add_table(
+        doc,
+        ["Ô trong app", "Cách nhập đúng", "Lỗi thường gặp"],
+        [
+            [
+                "URL",
+                "Nhập đầy đủ https://tenmien.com. Không nhập thiếu https:// và không cần thêm /wp-json.",
+                "Nếu chỉ nhập tenmien.com, app sẽ báo No scheme supplied.",
+            ],
+            [
+                "Username",
+                "Nhập username đăng nhập WordPress, ví dụ admin. Không dùng tên hiển thị nếu tên đó khác username.",
+                "Sai username thường gây lỗi 401 hoặc không có quyền tạo bài.",
+            ],
+            [
+                "Application password",
+                "Dùng mật khẩu ứng dụng tạo trong WordPress, không dùng mật khẩu đăng nhập bình thường.",
+                "Sai password hoặc dùng password thường sẽ báo rest_not_logged_in.",
+            ],
+        ],
+        [1.35, 3.0, 2.15],
+    )
+    add_numbers(
+        doc,
+        [
+            "Mở trang quản trị WordPress, ví dụ https://thongcongdongnai.com/wp-admin.",
+            "Đăng nhập bằng tài khoản có quyền tạo bài viết.",
+            "Vào Người dùng -> Hồ sơ. Nếu giao diện tiếng Anh: Users -> Profile.",
+            "Kéo xuống mục Mật khẩu ứng dụng hoặc Application Passwords.",
+            "Nhập tên ứng dụng, ví dụ WordPress Auto Poster, rồi bấm thêm mật khẩu ứng dụng mới.",
+            "Copy toàn bộ mật khẩu WordPress vừa sinh ra. Mật khẩu này chỉ hiện một lần.",
+            "Quay lại app, nhập URL, Username và Application password rồi bấm Kiểm tra kết nối.",
+            "Chỉ bấm đăng bài khi trạng thái kết nối báo OK.",
+        ],
+    )
+    add_note(
+        doc,
+        "Cách hiểu lỗi 401",
+        "Nếu app báo WordPress API error 401 hoặc rest_not_logged_in, nghĩa là WordPress chưa chấp nhận thông tin đăng nhập API. "
+        "Hãy tạo lại Application Password đúng user, kiểm tra username, và kiểm tra plugin bảo mật hoặc hosting có đang chặn REST API không.",
+        fill="FFF7E6",
+    )
+
+    doc.add_heading("3. Cấu trúc Excel app đang hỗ trợ", level=1)
     add_para(
         doc,
         "App tự chọn sheet có dữ liệu bài viết. Với workbook SEO, app ưu tiên sheet Bài SEO HTML "
@@ -279,7 +328,7 @@ def build_doc() -> None:
         fill="FFF7E6",
     )
 
-    doc.add_heading("3. Quy ước ảnh local", level=1)
+    doc.add_heading("4. Quy ước ảnh local", level=1)
     add_para(doc, "Nếu Excel có cột ma_bai, đặt ảnh trong cùng một thư mục theo quy ước sau:")
     add_table(
         doc,
@@ -304,7 +353,7 @@ def build_doc() -> None:
         ],
     )
 
-    doc.add_heading("4. Cách đăng bài thủ công", level=1)
+    doc.add_heading("5. Cách đăng bài thủ công", level=1)
     add_numbers(
         doc,
         [
@@ -320,7 +369,7 @@ def build_doc() -> None:
         ],
     )
 
-    doc.add_heading("5. Dùng lịch tự động", level=1)
+    doc.add_heading("6. Dùng lịch tự động", level=1)
     add_bullets(
         doc,
         [
@@ -339,7 +388,7 @@ def build_doc() -> None:
         "trong phiên hiện tại để job theo lịch có thể đăng bài.",
     )
 
-    doc.add_heading("6. Checklist trước khi đăng thật", level=1)
+    doc.add_heading("7. Checklist trước khi đăng thật", level=1)
     add_table(
         doc,
         ["Mục kiểm tra", "Trạng thái cần đạt"],
@@ -355,7 +404,7 @@ def build_doc() -> None:
         [2.45, 4.05],
     )
 
-    doc.add_heading("7. Xử lý lỗi thường gặp", level=1)
+    doc.add_heading("8. Xử lý lỗi thường gặp", level=1)
     add_table(
         doc,
         ["Hiện tượng", "Cách xử lý"],
@@ -363,6 +412,8 @@ def build_doc() -> None:
             ["App mở chậm", "Chờ thêm trong lần mở đầu vì exe one-file cần giải nén runtime."],
             ["Không đọc được Excel", "Kiểm tra file có sheet Bài SEO HTML hoặc cột title/content chuẩn."],
             ["Preview thiếu bài", "Kiểm tra hàng trống, tiêu đề trống hoặc cột Nội dung HTML thuần trống."],
+            ["No scheme supplied", "URL đang thiếu https://. Nhập dạng https://tenmien.com, không chỉ nhập tenmien.com."],
+            ["rest_not_logged_in / 401", "Sai username, sai Application Password hoặc WordPress đang chặn REST API."],
             ["Không kết nối WordPress", "Kiểm tra URL, username, Application Password và REST API."],
             ["Ảnh không khớp", "Đổi tên ảnh theo đúng ma_bai_bg, ma_bai_1, ma_bai_2."],
             ["Bài bị trùng", "App kiểm tra trùng theo title và có thể skip bài đã tồn tại."],
@@ -371,7 +422,7 @@ def build_doc() -> None:
         [2.05, 4.45],
     )
 
-    doc.add_heading("8. Nguyên tắc an toàn", level=1)
+    doc.add_heading("9. Nguyên tắc an toàn", level=1)
     add_bullets(
         doc,
         [
@@ -383,7 +434,7 @@ def build_doc() -> None:
         ],
     )
 
-    doc.add_heading("9. Tóm tắt thao tác nhanh", level=1)
+    doc.add_heading("10. Tóm tắt thao tác nhanh", level=1)
     add_table(
         doc,
         ["Mục tiêu", "Thao tác nhanh"],
