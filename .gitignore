@@ -9,6 +9,7 @@ build/
 dist/
 config/settings.json
 config/schedule.json
+config/run_history.json
 logs/
 *.log
 wordpress_post_report*.xlsx

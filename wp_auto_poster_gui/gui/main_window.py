@@ -47,12 +47,14 @@ _IMAGE_ALIGN_OPTIONS = [
 ]
 
 from wp_auto_poster_gui.core.excel_reader import ExcelValidationError, read_posts_from_excel
+from wp_auto_poster_gui.core.history_store import RunHistoryStore, current_timestamp
 from wp_auto_poster_gui.core.image_matcher import match_images_for_posts
 from wp_auto_poster_gui.core.models import PosterOptions, WordPressConfig
 from wp_auto_poster_gui.core.poster_service import export_links_to_source_excel, publish_from_excel
 from wp_auto_poster_gui.core.scheduler_service import SchedulerService
 from wp_auto_poster_gui.app_info import APP_ICON_PATH, APP_NAME
 from wp_auto_poster_gui.gui.config_dialog import AdvancedSettingsDialog
+from wp_auto_poster_gui.gui.history_tab import HistoryTab
 from wp_auto_poster_gui.gui.preview_table import fill_preview_table, fill_result_table, orphan_label_text
 from wp_auto_poster_gui.gui.schedule_tab import ScheduleTab
 from wp_auto_poster_gui.gui.tray_icon import create_tray_icon
@@ -94,6 +96,7 @@ class SelectPanel(QFrame):
 
 class MainWindow(QMainWindow):
     schedule_message = Signal(str)
+    history_changed = Signal()
 
     def __init__(self):
         super().__init__()
@@ -104,11 +107,13 @@ class MainWindow(QMainWindow):
 
         self.settings_path = Path("config/settings.json")
         self.scheduler = SchedulerService("config/schedule.json")
+        self.history_store = RunHistoryStore("config/run_history.json")
         self.results = []
         self.poster_worker: PosterWorker | None = None
         self.connection_worker: ConnectionTestWorker | None = None
         self.stop_event = Event()
         self._quitting = False
+        self._manual_run_started_at: str | None = None
 
         self.delay_seconds = 0
         self.retry_count = 3
@@ -120,6 +125,7 @@ class MainWindow(QMainWindow):
 
         self.tray_icon = create_tray_icon(self, self.windowIcon() or QIcon())
         self.schedule_message.connect(lambda message: self.tray_icon.showMessage(APP_NAME, message))
+        self.history_changed.connect(self.history_tab.refresh)
         self.schedule_tab.load_config(self.scheduler.config)
         self._apply_schedule()
 
@@ -129,6 +135,8 @@ class MainWindow(QMainWindow):
         self.schedule_tab = ScheduleTab()
         self.schedule_tab.config_changed.connect(self._on_schedule_changed)
         tabs.addTab(self.schedule_tab, "⏰ Lịch tự động")
+        self.history_tab = HistoryTab(self.history_store)
+        tabs.addTab(self.history_tab, "🕘 Lịch sử")
         self.setCentralWidget(tabs)
 
     def _apply_style(self) -> None:
@@ -615,6 +623,7 @@ class MainWindow(QMainWindow):
         ) != QMessageBox.Yes:
             return
 
+        self._manual_run_started_at = current_timestamp()
         self.stop_event.clear()
         self.progress.show()
         self.post_button.setEnabled(False)
@@ -643,7 +652,18 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         success = sum(1 for result in self.results if result.status == "success")
         self._log(f"Hoàn tất: {success}/{len(self.results)} thành công")
-        self._auto_export_source_link_excel()
+        export_path = self._auto_export_source_link_excel()
+        record = self._append_run_history(
+            mode="manual",
+            results=self.results,
+            excel_path=self.excel_edit.text().strip(),
+            image_folder=self.image_folder_edit.text().strip() or None,
+            export_path=export_path,
+            orphan_files=list(orphan_files),
+            started_at=self._manual_run_started_at,
+        )
+        self._manual_run_started_at = None
+        self._log(f"Đã lưu lịch sử chạy: {record.finished_at}")
 
     def _export_report(self) -> None:
         if not self.results:
@@ -665,21 +685,48 @@ class MainWindow(QMainWindow):
             export_path = self._export_source_link_excel(path)
             self._log(f"Đã xuất Excel gốc kèm link bài viết: {export_path}")
 
-    def _auto_export_source_link_excel(self) -> None:
+    def _auto_export_source_link_excel(self) -> Path | None:
         if not self.results:
-            return
+            return None
         try:
             export_path = self._export_source_link_excel()
         except Exception as exc:
             self._log(f"Lỗi xuất Excel gốc kèm link bài viết: {exc}")
-            return
+            return None
         self._log(f"Đã tự động xuất Excel gốc kèm link bài viết: {export_path}")
+        return export_path
 
     def _export_source_link_excel(self, output_path: str | Path | None = None) -> Path:
         excel_path = self.excel_edit.text().strip()
         if not excel_path:
             raise RuntimeError("Chưa chọn file Excel gốc")
         return export_links_to_source_excel(excel_path, self.results, output_path)
+
+    def _append_run_history(
+        self,
+        mode: str,
+        results,
+        excel_path: str,
+        image_folder: str | None,
+        export_path: str | Path | None,
+        orphan_files,
+        started_at: str | None,
+        summary: str | None = None,
+        error: str | None = None,
+    ):
+        record = self.history_store.append_run(
+            mode=mode,
+            excel_path=excel_path,
+            image_folder=image_folder,
+            results=list(results),
+            export_excel_path=export_path,
+            started_at=started_at,
+            summary=summary,
+            error=error,
+            orphan_files=list(orphan_files),
+        )
+        self.history_changed.emit()
+        return record
 
     def _on_schedule_changed(self) -> None:
         self.scheduler.config = self.schedule_tab.to_config()
@@ -695,23 +742,50 @@ class MainWindow(QMainWindow):
             self._log(f"Lỗi lịch: {exc}")
 
     def _run_scheduled_job(self) -> str:
+        started_at = current_timestamp()
         config = self._current_config(show_errors=False)
         if not config:
             raise RuntimeError("Thiếu cấu hình WordPress trong phiên hiện tại")
         schedule = self.scheduler.config
-        results, _ = publish_from_excel(
-            schedule.excel_path,
-            schedule.image_folder or None,
-            config,
-            self._poster_options(schedule.max_images_per_post, schedule_config=schedule),
-        )
-        success = sum(1 for result in results if result.status == "success")
-        summary = f"Đăng thành công {success}/{len(results)} bài"
         try:
-            export_path = export_links_to_source_excel(schedule.excel_path, list(results))
-            summary = f"{summary} - Excel: {export_path.name}"
+            results, orphan_files = publish_from_excel(
+                schedule.excel_path,
+                schedule.image_folder or None,
+                config,
+                self._poster_options(schedule.max_images_per_post, schedule_config=schedule),
+            )
+            success = sum(1 for result in results if result.status == "success")
+            summary = f"Đăng thành công {success}/{len(results)} bài"
+            export_path = None
+            try:
+                export_path = export_links_to_source_excel(schedule.excel_path, list(results))
+                summary = f"{summary} - Excel: {export_path.name}"
+            except Exception as exc:
+                summary = f"{summary} - lỗi xuất Excel: {exc}"
+            self._append_run_history(
+                mode="scheduled",
+                results=list(results),
+                excel_path=schedule.excel_path,
+                image_folder=schedule.image_folder or None,
+                export_path=export_path,
+                orphan_files=list(orphan_files),
+                started_at=started_at,
+                summary=summary,
+            )
         except Exception as exc:
-            summary = f"{summary} - lỗi xuất Excel: {exc}"
+            summary = f"Thất bại: {exc}"
+            self._append_run_history(
+                mode="scheduled",
+                results=[],
+                excel_path=schedule.excel_path,
+                image_folder=schedule.image_folder or None,
+                export_path=None,
+                orphan_files=[],
+                started_at=started_at,
+                summary=summary,
+                error=str(exc),
+            )
+            raise
         self.schedule_message.emit(summary)
         return summary
 
