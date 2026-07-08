@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from wp_auto_poster_gui.core.content_composer import compose_content_with_images
+from wp_auto_poster_gui.core.content_composer import compose_content_with_images, rewrite_existing_image_layout
 from wp_auto_poster_gui.core.models import UploadedMedia
 
 
@@ -57,6 +57,21 @@ class ContentComposerTest(unittest.TestCase):
         self.assertIn('src="https://example.com/uploads/bai01_thumb.jpg"', output)
         self.assertNotIn('src="bai01_thumb.jpg"', output)
         self.assertEqual(output.count("<img"), 1)
+
+    def test_rewrites_existing_image_alignment_and_size(self) -> None:
+        content = (
+            '<figure class="wp-block-image alignleft">'
+            '<img src="https://example.com/a.jpg" class="wp-image-10 alignleft" width="300" style="width:100%;height:auto" />'
+            "</figure>"
+        )
+
+        output = rewrite_existing_image_layout(content, alignment="alignright", display_size="medium")
+
+        self.assertIn('class="wp-block-image alignright"', output)
+        self.assertIn('class="wp-image-10 alignright"', output)
+        self.assertIn('width="600"', output)
+        self.assertNotIn("alignleft", output)
+        self.assertNotIn("width:100%", output)
 
 
 if __name__ == "__main__":

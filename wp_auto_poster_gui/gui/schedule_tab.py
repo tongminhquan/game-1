@@ -57,7 +57,7 @@ class ScheduleTab(QWidget):
         self.excel_edit = QLineEdit()
         self.excel_edit.setPlaceholderText("Chọn file Excel cố định cho lịch...")
         self.image_folder_edit = QLineEdit()
-        self.image_folder_edit.setPlaceholderText("(Tùy chọn) thư mục ảnh đặt tên theo ma_bai...")
+        self.image_folder_edit.setPlaceholderText("(Tùy chọn) thư mục ảnh hoặc file ZIP đặt tên theo ma_bai...")
 
         self.max_images_spin = QSpinBox()
         self.max_images_spin.setRange(0, 50)
@@ -114,8 +114,11 @@ class ScheduleTab(QWidget):
         image_row = QHBoxLayout()
         image_button = QPushButton("Chọn thư mục...")
         image_button.clicked.connect(self._choose_image_folder)
+        image_zip_button = QPushButton("Chọn ZIP...")
+        image_zip_button.clicked.connect(self._choose_image_zip)
         image_row.addWidget(self.image_folder_edit, 1)
         image_row.addWidget(image_button)
+        image_row.addWidget(image_zip_button)
 
         image_options = QHBoxLayout()
         image_options.addWidget(self.max_images_spin)
@@ -240,6 +243,11 @@ class ScheduleTab(QWidget):
 
     def _choose_image_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Chọn thư mục ảnh")
+        if path:
+            self.image_folder_edit.setText(path)
+
+    def _choose_image_zip(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Chọn file ZIP ảnh", "", "ZIP (*.zip)")
         if path:
             self.image_folder_edit.setText(path)
 

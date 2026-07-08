@@ -32,7 +32,7 @@ COLUMN_ALIASES = {
     "ma_bai": {"ma bai", "ma_bai", "id bai", "code"},
     "slug": {"slug", "duong dan", "duong dan tinh"},
     "seo_title": {"seo title", "tieu de seo", "rank math title"},
-    "meta_description": {"meta description", "mo ta meta", "mo ta meta seo", "meta seo"},
+    "meta_description": {"meta description", "mo ta", "mo ta meta", "mo ta meta seo", "meta seo"},
 }
 
 
@@ -99,6 +99,9 @@ def read_posts_from_excel(
         focus_parts.extend(secondary_keywords)
         focus_keywords = _dedupe(focus_parts)
 
+        slug = _clean(row.get(column_map.get("slug")))
+        ma_bai = _clean(row.get(column_map.get("ma_bai"))) or _post_code_from_slug(slug)
+
         posts.append(
             Post(
                 row_number=index + 2,
@@ -109,8 +112,8 @@ def read_posts_from_excel(
                 tags=tags,
                 status=_clean(row.get(column_map.get("status"))) or default_status,
                 publish_date=_clean(row.get(column_map.get("publish_date"))),
-                ma_bai=_clean(row.get(column_map.get("ma_bai"))),
-                slug=_clean(row.get(column_map.get("slug"))),
+                ma_bai=ma_bai,
+                slug=slug,
                 seo_title=_clean(row.get(column_map.get("seo_title"))) or title,
                 meta_description=_clean(row.get(column_map.get("meta_description"))),
                 focus_keywords=focus_keywords,
@@ -175,6 +178,17 @@ def _normalize_label(value: Any) -> str:
     text = "".join(character for character in text if not unicodedata.combining(character))
     text = text.lower().replace("_", " ")
     return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _post_code_from_slug(slug: str | None) -> str | None:
+    if not slug:
+        return None
+    text = slug.strip()
+    text = text.split("?", 1)[0].split("#", 1)[0]
+    if "://" in text:
+        text = text.rstrip("/").rsplit("/", 1)[-1]
+    text = text.strip("/")
+    return text or None
 
 
 def _dedupe(values: list[str]) -> list[str]:

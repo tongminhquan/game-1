@@ -6,10 +6,10 @@ import tempfile
 from pathlib import Path
 import time
 from threading import Event
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 from zipfile import ZipFile
 
-from .content_composer import compose_content_with_images
+from .content_composer import compose_content_with_images, rewrite_existing_image_layout
 from .excel_reader import REQUIRED_COLUMNS, _build_column_map, _normalize_label, read_posts_from_excel
 from .image_matcher import SUPPORTED_IMAGE_EXTENSIONS, match_images_for_posts
 from .models import Post, PostResult, PosterOptions, ProgressCallback, UploadedMedia, WordPressConfig
@@ -167,6 +167,232 @@ def _post_link(payload: object) -> str | None:
     return None
 
 
+def list_website_posts(
+    config: WordPressConfig,
+    progress_callback: ProgressCallback | None = None,
+    client_factory: ClientFactory = _make_client,
+) -> list[dict[str, Any]]:
+    progress = progress_callback or _default_progress
+    client = client_factory(config)
+    if not hasattr(client, "list_posts"):
+        raise RuntimeError("WordPress client không hỗ trợ tải danh sách bài viết")
+
+    progress("Đang tải danh sách bài viết từ website...")
+    posts = getattr(client, "list_posts")()
+    progress(f"Đã tải {len(posts)} bài viết từ website")
+    return list(posts)
+
+
+def publish_website_posts_bulk(
+    post_payloads: Iterable[dict[str, Any]],
+    config: WordPressConfig,
+    progress_callback: ProgressCallback | None = None,
+    stop_event: Event | None = None,
+    client_factory: ClientFactory = _make_client,
+) -> list[PostResult]:
+    progress = progress_callback or _default_progress
+    client = client_factory(config)
+    results: list[PostResult] = []
+
+    for index, payload in enumerate(post_payloads, start=1):
+        if stop_event and stop_event.is_set():
+            progress("Stopped by user")
+            break
+
+        post_id = _website_post_id(payload)
+        title = _website_post_title(payload)
+        progress(f"Đang xuất bản bài #{post_id or index}: {title}")
+        try:
+            if post_id is None:
+                results.append(PostResult(index, title, "failed", error="Bài viết không có ID"))
+                continue
+            response_payload = getattr(client, "update_post_status")(post_id, "publish")
+            link = _post_link(response_payload) or _post_link(payload)
+            results.append(PostResult(post_id, title, "success", link=link))
+            progress(f"Đã xuất bản: {title}")
+        except Exception as exc:
+            results.append(PostResult(post_id or index, title, "failed", error=str(exc)))
+            progress(f"Lỗi xuất bản bài #{post_id or index}: {exc}")
+
+    return results
+
+
+def update_website_posts_image_layout(
+    post_payloads: Iterable[dict[str, Any]],
+    config: WordPressConfig,
+    options: PosterOptions,
+    progress_callback: ProgressCallback | None = None,
+    stop_event: Event | None = None,
+    client_factory: ClientFactory = _make_client,
+) -> list[PostResult]:
+    progress = progress_callback or _default_progress
+    client = client_factory(config)
+    results: list[PostResult] = []
+
+    for index, payload in enumerate(post_payloads, start=1):
+        if stop_event and stop_event.is_set():
+            progress("Stopped by user")
+            break
+
+        post_id = _website_post_id(payload)
+        title = _website_post_title(payload)
+        progress(f"Đang sửa kích thước/căn ảnh bài #{post_id or index}: {title}")
+        try:
+            if post_id is None:
+                results.append(PostResult(index, title, "failed", error="Bài viết không có ID"))
+                continue
+
+            current_payload = getattr(client, "get_post")(post_id) if hasattr(client, "get_post") else payload
+            current_content = _post_content(current_payload) or _post_content(payload)
+            if not current_content:
+                results.append(PostResult(post_id, title, "skipped", error="Bài không có nội dung để sửa ảnh"))
+                progress(f"Bỏ qua bài không có nội dung: {title}")
+                continue
+
+            updated_content = rewrite_existing_image_layout(
+                current_content,
+                alignment=options.image_alignment,
+                display_size=options.image_display_size,
+                custom_width=options.image_custom_width,
+            )
+            if updated_content == current_content:
+                results.append(
+                    PostResult(
+                        post_id,
+                        title,
+                        "success",
+                        link=_post_link(current_payload) or _post_link(payload),
+                        error="Không có ảnh cần sửa",
+                    )
+                )
+                progress(f"Không có ảnh cần sửa: {title}")
+                continue
+
+            response_payload = getattr(client, "update_post_content")(post_id, updated_content)
+            link = _post_link(response_payload) or _post_link(current_payload) or _post_link(payload)
+            results.append(PostResult(post_id, title, "success", link=link))
+            progress(f"Đã sửa kích thước/căn ảnh: {title}")
+        except Exception as exc:
+            results.append(PostResult(post_id or index, title, "failed", error=str(exc)))
+            progress(f"Lỗi sửa ảnh bài #{post_id or index}: {exc}")
+
+    return results
+
+
+def _website_post_id(payload: object) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("id")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _website_post_title(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return "Không rõ tiêu đề"
+    title = payload.get("title")
+    value = ""
+    if isinstance(title, dict):
+        raw = title.get("raw") or title.get("rendered")
+        value = str(raw or "")
+    elif isinstance(title, str):
+        value = title
+    return _strip_html_text(value).strip() or "Không rõ tiêu đề"
+
+
+def _strip_html_text(value: str) -> str:
+    import html
+    import re
+
+    return html.unescape(re.sub(r"<[^>]+>", "", value))
+
+
+def update_existing_posts_image_layout(
+    posts: Iterable[Post],
+    config: WordPressConfig,
+    options: PosterOptions,
+    progress_callback: ProgressCallback | None = None,
+    stop_event: Event | None = None,
+    client_factory: ClientFactory = _make_client,
+) -> list[PostResult]:
+    progress = progress_callback or _default_progress
+    client = client_factory(config)
+    results: list[PostResult] = []
+
+    for post in posts:
+        if stop_event and stop_event.is_set():
+            progress("Stopped by user")
+            break
+
+        progress(f"Đang sửa ảnh bài đã đăng dòng {post.row_number}: {post.title}")
+        try:
+            existing_post = _find_existing_post(client, post)
+            if not existing_post:
+                results.append(PostResult(post.row_number, post.title, "skipped", error="Không tìm thấy bài đã đăng"))
+                progress(f"Không tìm thấy bài đã đăng: {post.title}")
+                continue
+
+            post_id = existing_post.get("id")
+            if post_id is None:
+                results.append(PostResult(post.row_number, post.title, "failed", error="Bài đã đăng không có ID"))
+                continue
+
+            current_payload = getattr(client, "get_post")(int(post_id)) if hasattr(client, "get_post") else existing_post
+            current_content = _post_content(current_payload) or _post_content(existing_post)
+            if not current_content:
+                results.append(PostResult(post.row_number, post.title, "skipped", error="Bài không có nội dung để sửa ảnh"))
+                progress(f"Bỏ qua bài không có nội dung: {post.title}")
+                continue
+
+            updated_content = rewrite_existing_image_layout(
+                current_content,
+                alignment=options.image_alignment,
+                display_size=options.image_display_size,
+                custom_width=options.image_custom_width,
+            )
+            if updated_content == current_content:
+                results.append(PostResult(post.row_number, post.title, "success", link=_post_link(current_payload), error="Không có ảnh cần sửa"))
+                progress(f"Không có ảnh cần sửa: {post.title}")
+                continue
+
+            if hasattr(client, "update_post_content"):
+                payload = getattr(client, "update_post_content")(int(post_id), updated_content)
+            else:
+                payload = getattr(client, "update_post")(int(post_id), post, updated_content, None)
+            link = _post_link(payload) or _post_link(current_payload) or _post_link(existing_post)
+            results.append(PostResult(post.row_number, post.title, "success", link=link))
+            progress(f"Đã sửa kích thước/căn ảnh: {post.title}")
+        except Exception as exc:
+            results.append(PostResult(post.row_number, post.title, "failed", error=str(exc)))
+            progress(f"Lỗi sửa ảnh dòng {post.row_number}: {exc}")
+
+    return results
+
+
+def _find_existing_post(client: object, post: Post) -> dict | None:
+    if post.slug and hasattr(client, "find_post_by_slug"):
+        found = getattr(client, "find_post_by_slug")(post.slug)
+        if found:
+            return found
+    return _find_duplicate_post(client, post.title)
+
+
+def _post_content(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        for key in ("raw", "rendered"):
+            value = content.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return None
+
+
 def publish_from_excel(
     excel_path: str | Path,
     image_folder: str | Path | None,
@@ -177,6 +403,9 @@ def publish_from_excel(
     client_factory: ClientFactory = _make_client,
 ) -> tuple[list[PostResult], list[Path]]:
     posts = read_posts_from_excel(excel_path, default_status=options.default_status)
+    if options.force_status:
+        for post in posts:
+            post.status = options.force_status
     progress = progress_callback or _default_progress
     prepared_source, cleanup = _prepare_image_source(excel_path, image_folder, posts, options, progress)
     try:
@@ -192,6 +421,46 @@ def publish_from_excel(
     finally:
         if cleanup is not None:
             cleanup.cleanup()
+
+
+def publish_existing_posts_bulk(
+    posts: Iterable[Post],
+    config: WordPressConfig,
+    progress_callback: ProgressCallback | None = None,
+    stop_event: Event | None = None,
+    client_factory: ClientFactory = _make_client,
+) -> list[PostResult]:
+    progress = progress_callback or _default_progress
+    client = client_factory(config)
+    results: list[PostResult] = []
+
+    for post in posts:
+        if stop_event and stop_event.is_set():
+            progress("Stopped by user")
+            break
+
+        progress(f"Đang xuất bản bài dòng {post.row_number}: {post.title}")
+        try:
+            existing_post = _find_existing_post(client, post)
+            if not existing_post:
+                results.append(PostResult(post.row_number, post.title, "skipped", error="Không tìm thấy bài đã đăng"))
+                progress(f"Không tìm thấy bài đã đăng: {post.title}")
+                continue
+
+            post_id = existing_post.get("id")
+            if post_id is None:
+                results.append(PostResult(post.row_number, post.title, "failed", error="Bài đã đăng không có ID"))
+                continue
+
+            payload = getattr(client, "update_post_status")(int(post_id), "publish")
+            link = _post_link(payload) or _post_link(existing_post)
+            results.append(PostResult(post.row_number, post.title, "success", link=link))
+            progress(f"Đã xuất bản: {post.title}")
+        except Exception as exc:
+            results.append(PostResult(post.row_number, post.title, "failed", error=str(exc)))
+            progress(f"Lỗi xuất bản dòng {post.row_number}: {exc}")
+
+    return results
 
 
 def _prepare_image_source(
@@ -234,6 +503,16 @@ def _prepare_image_source(
     return detected, None
 
 
+def prepare_image_source(
+    excel_path: str | Path,
+    image_source: str | Path | None,
+    posts: list[Post],
+    options: PosterOptions,
+    progress: ProgressCallback,
+) -> tuple[Path | None, tempfile.TemporaryDirectory | None]:
+    return _prepare_image_source(excel_path, image_source, posts, options, progress)
+
+
 def _find_matching_image_source(base_dir: Path, ma_bai_values: list[str]) -> Path | None:
     if not base_dir.exists():
         return None
@@ -241,11 +520,6 @@ def _find_matching_image_source(base_dir: Path, ma_bai_values: list[str]) -> Pat
         item
         for item in base_dir.iterdir()
         if item.is_dir() or item.suffix.lower() == ".zip"
-    ]
-    candidates = [
-        item
-        for item in candidates
-        if any(token in item.name.lower() for token in ["anh", "hinh", "image", "photo", "seo"])
     ]
     candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
     for candidate in candidates:

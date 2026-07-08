@@ -7,8 +7,13 @@ from zipfile import ZipFile
 
 from wp_auto_poster_gui.core.models import Post, PostResult, PosterOptions, UploadedMedia, WordPressConfig
 from wp_auto_poster_gui.core.poster_service import export_links_to_source_excel
+from wp_auto_poster_gui.core.poster_service import list_website_posts
+from wp_auto_poster_gui.core.poster_service import publish_existing_posts_bulk
 from wp_auto_poster_gui.core.poster_service import publish_posts
 from wp_auto_poster_gui.core.poster_service import publish_from_excel
+from wp_auto_poster_gui.core.poster_service import update_existing_posts_image_layout
+from wp_auto_poster_gui.core.poster_service import publish_website_posts_bulk
+from wp_auto_poster_gui.core.poster_service import update_website_posts_image_layout
 
 
 class FakeClient:
@@ -99,10 +104,10 @@ class PosterServiceTest(unittest.TestCase):
                 ]
             ).to_excel(excel_path, sheet_name="Bài SEO HTML", index=False)
 
-            zip_path = folder / "anh_SEO_test.zip"
+            zip_path = folder / "VER2 (2).zip"
             with ZipFile(zip_path, "w") as archive:
-                archive.writestr("bai01_bg.jpg", b"x")
-                archive.writestr("bai01_1.jpg", b"x")
+                archive.writestr("VER2/bai01_bg.jpg", b"x")
+                archive.writestr("VER2/bai01_1.jpg", b"x")
 
             results, orphans = publish_from_excel(
                 excel_path,
@@ -117,6 +122,169 @@ class PosterServiceTest(unittest.TestCase):
         self.assertEqual(len(fake.created), 1)
         self.assertIn("<img", fake.created[0][1])
         self.assertIsNotNone(fake.created[0][2])
+
+    def test_updates_existing_post_image_layout_without_republishing_fields(self) -> None:
+        class ImageLayoutClient:
+            def __init__(self):
+                self.updated_content: tuple[int, str] | None = None
+
+            def find_post_by_slug(self, slug: str):
+                if slug.strip("/") == "first":
+                    return {"id": 7, "link": "https://example.com/first"}
+                return None
+
+            def get_post(self, post_id: int):
+                return {
+                    "id": post_id,
+                    "link": "https://example.com/first",
+                    "content": {
+                        "raw": '<p>A</p><p><img src="https://example.com/a.jpg" class="wp-image-7 aligncenter" width="300" /></p>'
+                    },
+                }
+
+            def update_post_content(self, post_id: int, content: str):
+                self.updated_content = (post_id, content)
+                return {"id": post_id, "link": "https://example.com/first"}
+
+        fake = ImageLayoutClient()
+
+        results = update_existing_posts_image_layout(
+            [Post(2, "First", "<p>Excel content is not used here</p>", slug="/first/")],
+            WordPressConfig("https://example.com", "u", "p"),
+            PosterOptions(image_alignment="alignleft", image_display_size="large"),
+            client_factory=lambda _: fake,
+        )
+
+        self.assertEqual([result.status for result in results], ["success"])
+        self.assertIsNotNone(fake.updated_content)
+        self.assertEqual(fake.updated_content[0], 7)
+        self.assertIn("alignleft", fake.updated_content[1])
+        self.assertIn('width="900"', fake.updated_content[1])
+        self.assertNotIn("aligncenter", fake.updated_content[1])
+
+    def test_publish_from_excel_force_status_publish(self) -> None:
+        try:
+            import pandas as pd
+        except ImportError:
+            self.skipTest("pandas is not installed")
+
+        fake = FakeClient()
+
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            excel_path = folder / "posts.xlsx"
+            pd.DataFrame(
+                [
+                    {
+                        "ma_bai": "bai01",
+                        "Tiêu đề SEO": "First",
+                        "Nội dung HTML thuần": "<p>A</p>",
+                        "Slug": "first",
+                        "status": "draft",
+                    }
+                ]
+            ).to_excel(excel_path, sheet_name="Bài SEO HTML", index=False)
+
+            publish_from_excel(
+                excel_path,
+                None,
+                WordPressConfig("https://example.com", "u", "p"),
+                PosterOptions(default_status="publish", force_status="publish"),
+                client_factory=lambda _: fake,
+            )
+
+        self.assertEqual(fake.created[0][0].status, "publish")
+
+    def test_bulk_publish_existing_posts_updates_status_only(self) -> None:
+        class BulkClient:
+            def __init__(self):
+                self.updated: list[tuple[int, str]] = []
+
+            def find_post_by_slug(self, slug: str):
+                if slug.strip("/") == "first":
+                    return {"id": 7, "link": "https://example.com/first"}
+                return None
+
+            def update_post_status(self, post_id: int, status: str = "publish"):
+                self.updated.append((post_id, status))
+                return {"id": post_id, "link": "https://example.com/first"}
+
+        fake = BulkClient()
+        results = publish_existing_posts_bulk(
+            [Post(2, "First", "<p>A</p>", slug="/first/")],
+            WordPressConfig("https://example.com", "u", "p"),
+            client_factory=lambda _: fake,
+        )
+
+        self.assertEqual([result.status for result in results], ["success"])
+        self.assertEqual(fake.updated, [(7, "publish")])
+
+    def test_list_website_posts_uses_client_list_posts(self) -> None:
+        class WebsiteListClient:
+            def list_posts(self):
+                return [
+                    {"id": 9, "title": {"rendered": "Bài web"}, "status": "draft"},
+                ]
+
+        messages: list[str] = []
+        posts = list_website_posts(
+            WordPressConfig("https://example.com", "u", "p"),
+            progress_callback=messages.append,
+            client_factory=lambda _: WebsiteListClient(),
+        )
+
+        self.assertEqual(posts[0]["id"], 9)
+        self.assertIn("Đã tải 1 bài viết", messages[-1])
+
+    def test_publish_website_posts_bulk_updates_selected_ids(self) -> None:
+        class WebsitePublishClient:
+            def __init__(self):
+                self.updated: list[tuple[int, str]] = []
+
+            def update_post_status(self, post_id: int, status: str = "publish"):
+                self.updated.append((post_id, status))
+                return {"id": post_id, "link": f"https://example.com/{post_id}"}
+
+        fake = WebsitePublishClient()
+        results = publish_website_posts_bulk(
+            [{"id": 15, "title": {"rendered": "Bài nháp"}, "link": "https://example.com/draft"}],
+            WordPressConfig("https://example.com", "u", "p"),
+            client_factory=lambda _: fake,
+        )
+
+        self.assertEqual([result.status for result in results], ["success"])
+        self.assertEqual(fake.updated, [(15, "publish")])
+        self.assertEqual(results[0].row_number, 15)
+
+    def test_update_website_posts_image_layout_updates_content_by_id(self) -> None:
+        class WebsiteImageClient:
+            def __init__(self):
+                self.updated: list[tuple[int, str]] = []
+
+            def get_post(self, post_id: int):
+                return {
+                    "id": post_id,
+                    "title": {"rendered": "Bài có ảnh"},
+                    "link": "https://example.com/with-image",
+                    "content": {"raw": '<p><img src="https://example.com/a.jpg" /></p>'},
+                }
+
+            def update_post_content(self, post_id: int, content: str):
+                self.updated.append((post_id, content))
+                return {"id": post_id, "link": "https://example.com/with-image"}
+
+        fake = WebsiteImageClient()
+        results = update_website_posts_image_layout(
+            [{"id": 21, "title": {"rendered": "Bài có ảnh"}}],
+            WordPressConfig("https://example.com", "u", "p"),
+            PosterOptions(image_alignment="aligncenter", image_display_size="medium", image_custom_width=600),
+            client_factory=lambda _: fake,
+        )
+
+        self.assertEqual([result.status for result in results], ["success"])
+        self.assertEqual(fake.updated[0][0], 21)
+        self.assertIn("aligncenter", fake.updated[0][1])
+        self.assertIn("width=\"600\"", fake.updated[0][1])
 
     def test_export_links_to_source_excel_appends_adjacent_link_column(self) -> None:
         try:

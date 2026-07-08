@@ -242,6 +242,33 @@ def add_connection_section(doc: Document) -> None:
         "kiểm tra username, kiểm tra URL có https:// và kiểm tra plugin bảo mật/hosting có chặn REST API hay không.",
         fill=LIGHT_YELLOW,
     )
+    doc.add_heading("3.2. Cài plugin metadata SEO cho Rank Math", level=2)
+    add_para(
+        doc,
+        "Plugin này giúp WordPress REST API cho phép app ghi Tiêu đề SEO, Thẻ mô tả, Từ khóa chính và permalink vào "
+        "Rank Math. Nên cài plugin trước khi chạy đăng bài chính thức, đặc biệt nếu sau khi test các ô Rank Math vẫn "
+        "hiện trống trong phần Xem trước trình chỉnh sửa đoạn trích.",
+    )
+    add_numbers(
+        doc,
+        [
+            "Mở WordPress Admin của website cần đăng bài.",
+            "Vào Plugins -> Add New hoặc Gói mở rộng -> Cài mới.",
+            "Bấm Upload Plugin hoặc Tải plugin lên.",
+            "Chọn file wordpress/wordpress-auto-poster-rank-math-rest-meta.zip trong gói bàn giao.",
+            "Bấm Install Now hoặc Cài đặt ngay.",
+            "Sau khi cài xong, bấm Activate hoặc Kích hoạt.",
+            "Quay lại app PMEDIA, bấm Kiểm tra kết nối rồi đăng thử 1 bài ở trạng thái draft.",
+            "Mở bài draft trong WordPress và kiểm tra Rank Math đã có Tiêu đề SEO, Thẻ mô tả và Từ khóa chính.",
+        ],
+    )
+    add_note(
+        doc,
+        "Khi nào bắt buộc cài plugin metadata?",
+        "Nếu WordPress vẫn tạo được bài nhưng Rank Math không nhận SEO title, mô tả meta hoặc focus keyword, hãy cài "
+        "plugin này rồi chạy lại. Với bài đã tồn tại, app sẽ cập nhật lại metadata SEO khi xử lý bài trùng.",
+        fill=LIGHT_BLUE,
+    )
 
 
 def add_excel_section(doc: Document) -> None:

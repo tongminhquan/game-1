@@ -77,6 +77,7 @@ IMAGE_SIZE_WIDTH: dict[str, int | None] = {
 class PosterOptions:
     max_images_per_post: int = 2
     default_status: str = "draft"
+    force_status: str | None = None
     skip_duplicates: bool = True
     dry_run: bool = False
     image_alignment: str = "aligncenter"

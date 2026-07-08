@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import html
 from pathlib import Path
 import json
+import re
 from threading import Event
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -24,6 +27,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTabWidget,
     QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -50,7 +54,7 @@ from wp_auto_poster_gui.core.excel_reader import ExcelValidationError, read_post
 from wp_auto_poster_gui.core.history_store import RunHistoryStore, current_timestamp
 from wp_auto_poster_gui.core.image_matcher import match_images_for_posts
 from wp_auto_poster_gui.core.models import PosterOptions, WordPressConfig
-from wp_auto_poster_gui.core.poster_service import export_links_to_source_excel, publish_from_excel
+from wp_auto_poster_gui.core.poster_service import export_links_to_source_excel, prepare_image_source, publish_from_excel
 from wp_auto_poster_gui.core.scheduler_service import SchedulerService
 from wp_auto_poster_gui.app_info import APP_ICON_PATH, APP_NAME
 from wp_auto_poster_gui.gui.config_dialog import AdvancedSettingsDialog
@@ -58,7 +62,15 @@ from wp_auto_poster_gui.gui.history_tab import HistoryTab
 from wp_auto_poster_gui.gui.preview_table import fill_preview_table, fill_result_table, orphan_label_text
 from wp_auto_poster_gui.gui.schedule_tab import ScheduleTab
 from wp_auto_poster_gui.gui.tray_icon import create_tray_icon
-from wp_auto_poster_gui.gui.workers import ConnectionTestWorker, PosterWorker
+from wp_auto_poster_gui.gui.workers import (
+    BulkPublishWorker,
+    ConnectionTestWorker,
+    ImageLayoutUpdateWorker,
+    PosterWorker,
+    WebsiteBulkPublishWorker,
+    WebsiteImageLayoutUpdateWorker,
+    WebsitePostsLoadWorker,
+)
 
 
 class SelectPanel(QFrame):
@@ -110,7 +122,13 @@ class MainWindow(QMainWindow):
         self.history_store = RunHistoryStore("config/run_history.json")
         self.results = []
         self.poster_worker: PosterWorker | None = None
+        self.image_layout_worker: ImageLayoutUpdateWorker | None = None
+        self.bulk_publish_worker: BulkPublishWorker | None = None
+        self.website_loader_worker: WebsitePostsLoadWorker | None = None
+        self.website_bulk_publish_worker: WebsiteBulkPublishWorker | None = None
+        self.website_image_layout_worker: WebsiteImageLayoutUpdateWorker | None = None
         self.connection_worker: ConnectionTestWorker | None = None
+        self.website_posts: list[dict] = []
         self.stop_event = Event()
         self._quitting = False
         self._manual_run_started_at: str | None = None
@@ -132,6 +150,7 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         tabs = QTabWidget()
         tabs.addTab(self._manual_tab_compact(), "📝 Đăng thủ công")
+        tabs.addTab(self._website_posts_tab(), "🌐 Bài trên web")
         self.schedule_tab = ScheduleTab()
         self.schedule_tab.config_changed.connect(self._on_schedule_changed)
         tabs.addTab(self.schedule_tab, "⏰ Lịch tự động")
@@ -280,6 +299,9 @@ class MainWindow(QMainWindow):
         self.max_images_spin = QSpinBox()
         self.max_images_spin.setRange(0, 50)
         self.max_images_spin.setValue(2)
+        self.max_images_spin.setFixedWidth(86)
+        self.max_images_spin.setAccelerated(True)
+        self.max_images_spin.valueChanged.connect(lambda *_args: self._refresh_preview())
 
         self.image_size_combo = QComboBox()
         for label, _value in _IMAGE_SIZE_OPTIONS:
@@ -297,7 +319,7 @@ class MainWindow(QMainWindow):
 
         self.excel_panel = SelectPanel("File Excel bài viết", "Chưa chọn file Excel")
         self.excel_panel.clicked.connect(self._choose_excel)
-        self.image_panel = SelectPanel("Thư mục ảnh (tùy chọn)", "Chưa chọn thư mục ảnh")
+        self.image_panel = SelectPanel("Thư mục ảnh hoặc ZIP (tùy chọn)", "Chưa chọn nguồn ảnh")
         self.image_panel.clicked.connect(self._choose_image_folder)
         source_cards = QHBoxLayout()
         source_cards.setSpacing(8)
@@ -308,7 +330,7 @@ class MainWindow(QMainWindow):
         source_options = QHBoxLayout()
         source_options.addWidget(QLabel("Số ảnh tối đa chèn mỗi bài:"))
         source_options.addWidget(self.max_images_spin)
-        clear_images_button = QPushButton("Bỏ chọn thư mục ảnh")
+        clear_images_button = QPushButton("Bỏ chọn nguồn ảnh")
         clear_images_button.clicked.connect(self._clear_image_folder)
         source_options.addWidget(clear_images_button)
         source_options.addSpacing(10)
@@ -317,6 +339,8 @@ class MainWindow(QMainWindow):
         source_options.addWidget(self.image_custom_width_spin)
         source_options.addWidget(QLabel("Căn ảnh:"))
         source_options.addWidget(self.image_align_combo)
+        self.publish_now_check = QCheckBox("Xuất bản ngay khi đăng mới")
+        source_options.addWidget(self.publish_now_check)
         source_options.addStretch(1)
         source_layout.addLayout(source_options)
 
@@ -333,6 +357,12 @@ class MainWindow(QMainWindow):
         self.post_button = QPushButton("🚀 Đăng ngay")
         self.post_button.setFixedWidth(112)
         self.post_button.clicked.connect(self._start_publish)
+        self.update_image_layout_button = QPushButton("🖼 Sửa ảnh bài đã đăng")
+        self.update_image_layout_button.setFixedWidth(168)
+        self.update_image_layout_button.clicked.connect(self._start_update_image_layout)
+        self.bulk_publish_button = QPushButton("📣 Xuất bản hàng loạt")
+        self.bulk_publish_button.setFixedWidth(152)
+        self.bulk_publish_button.clicked.connect(self._start_bulk_publish)
         self.stop_button = QPushButton("■ Dừng")
         self.stop_button.setFixedWidth(90)
         self.stop_button.setEnabled(False)
@@ -342,6 +372,8 @@ class MainWindow(QMainWindow):
         self.progress.hide()
         action_row = QHBoxLayout()
         action_row.addWidget(self.post_button)
+        action_row.addWidget(self.update_image_layout_button)
+        action_row.addWidget(self.bulk_publish_button)
         action_row.addWidget(self.stop_button)
         action_row.addWidget(self.progress, 1)
         action_row.addStretch(1)
@@ -378,6 +410,95 @@ class MainWindow(QMainWindow):
         layout.addLayout(bottom_row, 3)
         layout.addLayout(advanced_row)
         self._update_source_panels()
+        return page
+
+    def _website_posts_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+
+        list_box = QGroupBox("1. Nhận diện bài đang có trên website")
+        list_layout = QVBoxLayout(list_box)
+        list_actions = QHBoxLayout()
+        self.website_load_button = QPushButton("🔄 Tải bài từ website")
+        self.website_load_button.clicked.connect(self._load_website_posts)
+        self.website_select_all_button = QPushButton("Chọn tất cả")
+        self.website_select_all_button.clicked.connect(self._select_all_website_posts)
+        self.website_clear_selection_button = QPushButton("Bỏ chọn")
+        self.website_clear_selection_button.clicked.connect(self._clear_website_post_selection)
+        self.website_status_label = QLabel("Chưa tải danh sách bài viết.")
+        self.website_status_label.setObjectName("mutedLabel")
+        list_actions.addWidget(self.website_load_button)
+        list_actions.addWidget(self.website_select_all_button)
+        list_actions.addWidget(self.website_clear_selection_button)
+        list_actions.addWidget(self.website_status_label, 1)
+        list_layout.addLayout(list_actions)
+
+        self.website_posts_table = QTableWidget()
+        self.website_posts_table.setAlternatingRowColors(True)
+        list_layout.addWidget(self.website_posts_table, 1)
+
+        action_box = QGroupBox("2. Thao tác hàng loạt")
+        action_layout = QVBoxLayout(action_box)
+        image_options = QHBoxLayout()
+        self.website_image_size_combo = QComboBox()
+        for label, _value in _IMAGE_SIZE_OPTIONS:
+            self.website_image_size_combo.addItem(label)
+        self.website_image_custom_width_spin = QSpinBox()
+        self.website_image_custom_width_spin.setRange(100, 2000)
+        self.website_image_custom_width_spin.setValue(800)
+        self.website_image_custom_width_spin.setSuffix(" px")
+        self.website_image_custom_width_spin.setVisible(False)
+        self.website_image_size_combo.currentIndexChanged.connect(self._on_website_image_size_changed)
+        self.website_image_align_combo = QComboBox()
+        for label, _value in _IMAGE_ALIGN_OPTIONS:
+            self.website_image_align_combo.addItem(label)
+        image_options.addWidget(QLabel("Kích thước ảnh:"))
+        image_options.addWidget(self.website_image_size_combo)
+        image_options.addWidget(self.website_image_custom_width_spin)
+        image_options.addWidget(QLabel("Căn ảnh:"))
+        image_options.addWidget(self.website_image_align_combo)
+        image_options.addStretch(1)
+        action_layout.addLayout(image_options)
+
+        website_actions = QHBoxLayout()
+        self.website_publish_button = QPushButton("📣 Xuất bản bài đã chọn")
+        self.website_publish_button.clicked.connect(self._start_website_bulk_publish)
+        self.website_update_image_button = QPushButton("🖼 Sửa cỡ/căn ảnh bài đã chọn")
+        self.website_update_image_button.clicked.connect(self._start_website_image_layout_update)
+        self.website_stop_button = QPushButton("■ Dừng")
+        self.website_stop_button.setFixedWidth(90)
+        self.website_stop_button.setEnabled(False)
+        self.website_stop_button.clicked.connect(self._stop_website_bulk_action)
+        self.website_progress = QProgressBar()
+        self.website_progress.setRange(0, 0)
+        self.website_progress.hide()
+        website_actions.addWidget(self.website_publish_button)
+        website_actions.addWidget(self.website_update_image_button)
+        website_actions.addWidget(self.website_stop_button)
+        website_actions.addWidget(self.website_progress, 1)
+        action_layout.addLayout(website_actions)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(8)
+        web_log_box = QGroupBox("Log")
+        web_log_layout = QVBoxLayout(web_log_box)
+        self.website_log_box = QTextEdit()
+        self.website_log_box.setReadOnly(True)
+        web_log_layout.addWidget(self.website_log_box)
+        web_result_box = QGroupBox("3. Kết quả")
+        web_result_layout = QVBoxLayout(web_result_box)
+        self.website_result_table = QTableWidget()
+        self.website_result_table.setAlternatingRowColors(True)
+        web_result_layout.addWidget(self.website_result_table)
+        bottom_row.addWidget(web_log_box, 5)
+        bottom_row.addWidget(web_result_box, 7)
+
+        layout.addWidget(list_box, 5)
+        layout.addWidget(action_box)
+        layout.addLayout(bottom_row, 3)
+        self._fill_website_posts_table()
         return page
 
     def _manual_tab(self) -> QWidget:
@@ -513,7 +634,20 @@ class MainWindow(QMainWindow):
             self._refresh_preview()
 
     def _choose_image_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Chọn thư mục ảnh")
+        choice = QMessageBox(self)
+        choice.setWindowTitle("Chọn nguồn ảnh")
+        choice.setText("Bạn muốn chọn thư mục ảnh đã giải nén hay chọn file ZIP ảnh?")
+        folder_button = choice.addButton("Chọn thư mục", QMessageBox.AcceptRole)
+        zip_button = choice.addButton("Chọn file ZIP", QMessageBox.ActionRole)
+        choice.addButton("Hủy", QMessageBox.RejectRole)
+        choice.setDefaultButton(folder_button)
+        choice.exec()
+
+        path = ""
+        if choice.clickedButton() == folder_button:
+            path = QFileDialog.getExistingDirectory(self, "Chọn thư mục ảnh")
+        elif choice.clickedButton() == zip_button:
+            path, _ = QFileDialog.getOpenFileName(self, "Chọn file ZIP ảnh", "", "ZIP (*.zip)")
         if path:
             self.image_folder_edit.setText(path)
             self._update_source_panels()
@@ -528,7 +662,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "excel_panel"):
             self.excel_panel.set_path(self.excel_edit.text().strip(), "Chưa chọn file Excel")
         if hasattr(self, "image_panel"):
-            self.image_panel.set_path(self.image_folder_edit.text().strip(), "Chưa chọn thư mục ảnh")
+            self.image_panel.set_path(self.image_folder_edit.text().strip(), "Chưa chọn nguồn ảnh")
 
     def _refresh_preview(self) -> bool:
         excel_path = self.excel_edit.text().strip()
@@ -536,11 +670,23 @@ class MainWindow(QMainWindow):
             return False
         try:
             posts = read_posts_from_excel(excel_path)
-            matches, orphan_files = match_images_for_posts(
-                self.image_folder_edit.text().strip() or None,
-                [post.ma_bai or "" for post in posts if post.ma_bai],
-                self.max_images_spin.value(),
-            )
+            cleanup = None
+            try:
+                prepared_source, cleanup = prepare_image_source(
+                    excel_path,
+                    self.image_folder_edit.text().strip() or None,
+                    posts,
+                    self._poster_options(),
+                    self._log,
+                )
+                matches, orphan_files = match_images_for_posts(
+                    prepared_source,
+                    [post.ma_bai or "" for post in posts if post.ma_bai],
+                    self.max_images_spin.value(),
+                )
+            finally:
+                if cleanup is not None:
+                    cleanup.cleanup()
             fill_preview_table(self.preview_table, posts, matches)
             self.orphan_label.setText(orphan_label_text(orphan_files))
             self._log(f"Preview {len(posts)} bài")
@@ -582,6 +728,218 @@ class MainWindow(QMainWindow):
         custom_width = self.image_custom_width_spin.value()
         return alignment, display_size, custom_width
 
+    def _on_website_image_size_changed(self, *_args) -> None:
+        index = self.website_image_size_combo.currentIndex()
+        size_value = _IMAGE_SIZE_OPTIONS[index][1] if index < len(_IMAGE_SIZE_OPTIONS) else "auto"
+        self.website_image_custom_width_spin.setVisible(size_value == "custom")
+
+    def _current_website_image_settings(self) -> tuple[str, str, int]:
+        size_index = self.website_image_size_combo.currentIndex()
+        display_size = _IMAGE_SIZE_OPTIONS[size_index][1] if size_index < len(_IMAGE_SIZE_OPTIONS) else "auto"
+        align_index = self.website_image_align_combo.currentIndex()
+        alignment = _IMAGE_ALIGN_OPTIONS[align_index][1] if align_index < len(_IMAGE_ALIGN_OPTIONS) else "aligncenter"
+        custom_width = self.website_image_custom_width_spin.value()
+        return alignment, display_size, custom_width
+
+    def _website_poster_options(self) -> PosterOptions:
+        alignment, display_size, custom_width = self._current_website_image_settings()
+        return PosterOptions(
+            max_images_per_post=0,
+            image_alignment=alignment,
+            image_display_size=display_size,
+            image_custom_width=custom_width,
+        )
+
+    def _load_website_posts(self) -> None:
+        config = self._current_config()
+        if not config:
+            return
+        self._set_website_busy(True)
+        self.website_status_label.setText("Đang tải danh sách bài viết...")
+        self.website_loader_worker = WebsitePostsLoadWorker(config)
+        self.website_loader_worker.progress.connect(self._website_log)
+        self.website_loader_worker.completed.connect(self._on_website_posts_loaded)
+        self.website_loader_worker.start()
+
+    def _on_website_posts_loaded(self, posts) -> None:
+        self.website_posts = list(posts)
+        self._fill_website_posts_table()
+        self._set_website_busy(False)
+        self.website_status_label.setText(f"Đã tải {len(self.website_posts)} bài viết.")
+        self._website_log(f"Đã nhận diện {len(self.website_posts)} bài viết trên website")
+
+    def _fill_website_posts_table(self) -> None:
+        headers = ["Chọn", "ID", "Trạng thái", "Tiêu đề", "Slug", "Link"]
+        self.website_posts_table.setColumnCount(len(headers))
+        self.website_posts_table.setHorizontalHeaderLabels(headers)
+        self.website_posts_table.setRowCount(len(self.website_posts))
+        for row_index, payload in enumerate(self.website_posts):
+            check_item = QTableWidgetItem("")
+            check_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            check_item.setCheckState(Qt.Unchecked)
+            self.website_posts_table.setItem(row_index, 0, check_item)
+
+            values = [
+                str(_website_payload_id(payload) or ""),
+                _website_payload_status(payload),
+                _website_payload_title(payload),
+                _website_payload_slug(payload),
+                _website_payload_link(payload),
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                self.website_posts_table.setItem(row_index, column, item)
+        self.website_posts_table.resizeColumnsToContents()
+        self.website_posts_table.horizontalHeader().setStretchLastSection(True)
+
+    def _select_all_website_posts(self) -> None:
+        for row in range(self.website_posts_table.rowCount()):
+            item = self.website_posts_table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.Checked)
+        self.website_status_label.setText(f"Đã chọn {self.website_posts_table.rowCount()} bài viết.")
+
+    def _clear_website_post_selection(self) -> None:
+        for row in range(self.website_posts_table.rowCount()):
+            item = self.website_posts_table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.Unchecked)
+        self.website_status_label.setText("Đã bỏ chọn tất cả bài viết.")
+
+    def _selected_website_posts(self) -> list[dict]:
+        selected: list[dict] = []
+        for row in range(self.website_posts_table.rowCount()):
+            item = self.website_posts_table.item(row, 0)
+            if item and item.checkState() == Qt.Checked and row < len(self.website_posts):
+                selected.append(self.website_posts[row])
+        return selected
+
+    def _start_website_bulk_publish(self) -> None:
+        selected_posts = self._selected_website_posts()
+        if not selected_posts:
+            QMessageBox.warning(self, "Chưa chọn bài", "Cần tick chọn ít nhất một bài viết trên website.")
+            return
+        config = self._current_config()
+        if not config:
+            return
+        if QMessageBox.question(
+            self,
+            "Xác nhận xuất bản bài trên web",
+            f"Ứng dụng sẽ chuyển {len(selected_posts)} bài đã chọn sang trạng thái publish. Nội dung bài viết không bị thay đổi.",
+        ) != QMessageBox.Yes:
+            return
+
+        self._manual_run_started_at = current_timestamp()
+        self.stop_event.clear()
+        self._set_website_busy(True, allow_stop=True)
+        self.website_bulk_publish_worker = WebsiteBulkPublishWorker(selected_posts, config, self.stop_event)
+        self.website_bulk_publish_worker.progress.connect(self._website_log)
+        self.website_bulk_publish_worker.completed.connect(self._on_website_bulk_publish_completed)
+        self.website_bulk_publish_worker.start()
+
+    def _start_website_image_layout_update(self) -> None:
+        selected_posts = self._selected_website_posts()
+        if not selected_posts:
+            QMessageBox.warning(self, "Chưa chọn bài", "Cần tick chọn ít nhất một bài viết trên website.")
+            return
+        config = self._current_config()
+        if not config:
+            return
+        if QMessageBox.question(
+            self,
+            "Xác nhận sửa ảnh bài trên web",
+            f"Ứng dụng sẽ sửa kích thước và căn ảnh trong {len(selected_posts)} bài đã chọn. Nội dung chữ, SEO, danh mục và tags không bị thay đổi.",
+        ) != QMessageBox.Yes:
+            return
+
+        self._manual_run_started_at = current_timestamp()
+        self.stop_event.clear()
+        self._set_website_busy(True, allow_stop=True)
+        self.website_image_layout_worker = WebsiteImageLayoutUpdateWorker(
+            selected_posts,
+            config,
+            self._website_poster_options(),
+            self.stop_event,
+        )
+        self.website_image_layout_worker.progress.connect(self._website_log)
+        self.website_image_layout_worker.completed.connect(self._on_website_image_layout_update_completed)
+        self.website_image_layout_worker.start()
+
+    def _stop_website_bulk_action(self) -> None:
+        self.stop_event.set()
+        self._website_log("Đã yêu cầu dừng sau bài hiện tại")
+
+    def _on_website_bulk_publish_completed(self, results) -> None:
+        self.results = list(results)
+        fill_result_table(self.website_result_table, self.results)
+        fill_result_table(self.result_table, self.results)
+        self._mark_website_posts_published(self.results)
+        self._set_website_busy(False)
+        success = sum(1 for result in self.results if result.status == "success")
+        self.website_status_label.setText(f"Xuất bản xong: {success}/{len(self.results)} thành công.")
+        self._website_log(f"Hoàn tất xuất bản bài trên web: {success}/{len(self.results)} thành công")
+        record = self._append_run_history(
+            mode="website_bulk_publish",
+            results=self.results,
+            excel_path="",
+            image_folder=None,
+            export_path=None,
+            orphan_files=[],
+            started_at=self._manual_run_started_at,
+        )
+        self._manual_run_started_at = None
+        self._website_log(f"Đã lưu lịch sử xuất bản bài trên web: {record.finished_at}")
+
+    def _on_website_image_layout_update_completed(self, results) -> None:
+        self.results = list(results)
+        fill_result_table(self.website_result_table, self.results)
+        fill_result_table(self.result_table, self.results)
+        self._set_website_busy(False)
+        success = sum(1 for result in self.results if result.status == "success")
+        self.website_status_label.setText(f"Sửa ảnh xong: {success}/{len(self.results)} thành công.")
+        self._website_log(f"Hoàn tất sửa ảnh bài trên web: {success}/{len(self.results)} thành công")
+        record = self._append_run_history(
+            mode="website_image_layout",
+            results=self.results,
+            excel_path="",
+            image_folder=None,
+            export_path=None,
+            orphan_files=[],
+            started_at=self._manual_run_started_at,
+        )
+        self._manual_run_started_at = None
+        self._website_log(f"Đã lưu lịch sử sửa ảnh bài trên web: {record.finished_at}")
+
+    def _mark_website_posts_published(self, results) -> None:
+        published_ids = {
+            int(result.row_number)
+            for result in results
+            if result.status == "success" and str(result.row_number).isdigit()
+        }
+        if not published_ids:
+            return
+        for payload in self.website_posts:
+            post_id = _website_payload_id(payload)
+            if post_id in published_ids:
+                payload["status"] = "publish"
+        self._fill_website_posts_table()
+
+    def _set_website_busy(self, busy: bool, allow_stop: bool = False) -> None:
+        self.website_progress.setVisible(busy)
+        self.website_load_button.setEnabled(not busy)
+        self.website_select_all_button.setEnabled(not busy)
+        self.website_clear_selection_button.setEnabled(not busy)
+        self.website_publish_button.setEnabled(not busy)
+        self.website_update_image_button.setEnabled(not busy)
+        self.website_stop_button.setEnabled(busy and allow_stop)
+
+    def _website_log(self, message: str) -> None:
+        if hasattr(self, "website_log_box"):
+            self.website_log_box.append(message)
+            self.website_log_box.verticalScrollBar().setValue(self.website_log_box.verticalScrollBar().maximum())
+        self._log(message)
+
     def _poster_options(self, max_images: int | None = None, schedule_config=None) -> PosterOptions:
         if schedule_config is not None:
             return PosterOptions(
@@ -593,6 +951,8 @@ class MainWindow(QMainWindow):
         alignment, display_size, custom_width = self._current_image_settings()
         return PosterOptions(
             max_images_per_post=max_images if max_images is not None else self.max_images_spin.value(),
+            default_status="publish" if self.publish_now_check.isChecked() else "draft",
+            force_status="publish" if self.publish_now_check.isChecked() else None,
             image_alignment=alignment,
             image_display_size=display_size,
             image_custom_width=custom_width,
@@ -627,6 +987,8 @@ class MainWindow(QMainWindow):
         self.stop_event.clear()
         self.progress.show()
         self.post_button.setEnabled(False)
+        self.update_image_layout_button.setEnabled(False)
+        self.bulk_publish_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.poster_worker = PosterWorker(
             self.excel_edit.text().strip(),
@@ -639,6 +1001,70 @@ class MainWindow(QMainWindow):
         self.poster_worker.completed.connect(self._on_publish_completed)
         self.poster_worker.start()
 
+    def _start_update_image_layout(self) -> None:
+        excel_path = self.excel_edit.text().strip()
+        if not excel_path:
+            QMessageBox.warning(self, "Chưa có file Excel", "Cần chọn file Excel để xác định các bài đã đăng cần sửa ảnh.")
+            return
+        config = self._current_config()
+        if not config:
+            return
+        if QMessageBox.question(
+            self,
+            "Xác nhận sửa ảnh bài đã đăng",
+            "Ứng dụng sẽ tìm các bài đã đăng theo Slug hoặc tiêu đề trong Excel, sau đó cập nhật lại kích thước và căn ảnh theo lựa chọn hiện tại. Nội dung chữ, SEO, danh mục và tags không bị thay đổi.",
+        ) != QMessageBox.Yes:
+            return
+
+        self._manual_run_started_at = current_timestamp()
+        self.stop_event.clear()
+        self.progress.show()
+        self.post_button.setEnabled(False)
+        self.update_image_layout_button.setEnabled(False)
+        self.bulk_publish_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.image_layout_worker = ImageLayoutUpdateWorker(
+            excel_path,
+            config,
+            self._poster_options(),
+            self.stop_event,
+        )
+        self.image_layout_worker.progress.connect(self._log)
+        self.image_layout_worker.completed.connect(self._on_image_layout_update_completed)
+        self.image_layout_worker.start()
+
+    def _start_bulk_publish(self) -> None:
+        excel_path = self.excel_edit.text().strip()
+        if not excel_path:
+            QMessageBox.warning(self, "Chưa có file Excel", "Cần chọn file Excel để xác định các bài cần xuất bản.")
+            return
+        config = self._current_config()
+        if not config:
+            return
+        if QMessageBox.question(
+            self,
+            "Xác nhận xuất bản hàng loạt",
+            "Ứng dụng sẽ tìm các bài đã có trên WordPress theo Slug hoặc tiêu đề trong Excel và chuyển trạng thái sang publish. Nội dung bài viết không bị thay đổi.",
+        ) != QMessageBox.Yes:
+            return
+
+        self._manual_run_started_at = current_timestamp()
+        self.stop_event.clear()
+        self.progress.show()
+        self.post_button.setEnabled(False)
+        self.update_image_layout_button.setEnabled(False)
+        self.bulk_publish_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.bulk_publish_worker = BulkPublishWorker(
+            excel_path,
+            config,
+            self._poster_options(),
+            self.stop_event,
+        )
+        self.bulk_publish_worker.progress.connect(self._log)
+        self.bulk_publish_worker.completed.connect(self._on_bulk_publish_completed)
+        self.bulk_publish_worker.start()
+
     def _stop_publish(self) -> None:
         self.stop_event.set()
         self._log("Đã yêu cầu dừng sau bài hiện tại")
@@ -649,6 +1075,8 @@ class MainWindow(QMainWindow):
         self.orphan_label.setText(orphan_label_text(list(orphan_files)))
         self.progress.hide()
         self.post_button.setEnabled(True)
+        self.update_image_layout_button.setEnabled(True)
+        self.bulk_publish_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         success = sum(1 for result in self.results if result.status == "success")
         self._log(f"Hoàn tất: {success}/{len(self.results)} thành công")
@@ -664,6 +1092,52 @@ class MainWindow(QMainWindow):
         )
         self._manual_run_started_at = None
         self._log(f"Đã lưu lịch sử chạy: {record.finished_at}")
+
+    def _on_image_layout_update_completed(self, results) -> None:
+        self.results = list(results)
+        fill_result_table(self.result_table, self.results)
+        self.orphan_label.clear()
+        self.progress.hide()
+        self.post_button.setEnabled(True)
+        self.update_image_layout_button.setEnabled(True)
+        self.bulk_publish_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        success = sum(1 for result in self.results if result.status == "success")
+        self._log(f"Hoàn tất sửa ảnh: {success}/{len(self.results)} thành công")
+        record = self._append_run_history(
+            mode="image_layout",
+            results=self.results,
+            excel_path=self.excel_edit.text().strip(),
+            image_folder=self.image_folder_edit.text().strip() or None,
+            export_path=None,
+            orphan_files=[],
+            started_at=self._manual_run_started_at,
+        )
+        self._manual_run_started_at = None
+        self._log(f"Đã lưu lịch sử sửa ảnh: {record.finished_at}")
+
+    def _on_bulk_publish_completed(self, results) -> None:
+        self.results = list(results)
+        fill_result_table(self.result_table, self.results)
+        self.orphan_label.clear()
+        self.progress.hide()
+        self.post_button.setEnabled(True)
+        self.update_image_layout_button.setEnabled(True)
+        self.bulk_publish_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        success = sum(1 for result in self.results if result.status == "success")
+        self._log(f"Hoàn tất xuất bản hàng loạt: {success}/{len(self.results)} thành công")
+        record = self._append_run_history(
+            mode="bulk_publish",
+            results=self.results,
+            excel_path=self.excel_edit.text().strip(),
+            image_folder=self.image_folder_edit.text().strip() or None,
+            export_path=None,
+            orphan_files=[],
+            started_at=self._manual_run_started_at,
+        )
+        self._manual_run_started_at = None
+        self._log(f"Đã lưu lịch sử xuất bản hàng loạt: {record.finished_at}")
 
     def _export_report(self) -> None:
         if not self.results:
@@ -813,14 +1287,23 @@ class MainWindow(QMainWindow):
         for i, (_label, value) in enumerate(_IMAGE_SIZE_OPTIONS):
             if value == saved_size:
                 self.image_size_combo.setCurrentIndex(i)
+                if hasattr(self, "website_image_size_combo"):
+                    self.website_image_size_combo.setCurrentIndex(i)
                 break
         saved_align = data.get("image_alignment", "aligncenter")
         for i, (_label, value) in enumerate(_IMAGE_ALIGN_OPTIONS):
             if value == saved_align:
                 self.image_align_combo.setCurrentIndex(i)
+                if hasattr(self, "website_image_align_combo"):
+                    self.website_image_align_combo.setCurrentIndex(i)
                 break
         self.image_custom_width_spin.setValue(int(data.get("image_custom_width", 800)))
+        if hasattr(self, "website_image_custom_width_spin"):
+            self.website_image_custom_width_spin.setValue(int(data.get("image_custom_width", 800)))
+        self.publish_now_check.setChecked(bool(data.get("publish_now", False)))
         self._on_image_size_changed()
+        if hasattr(self, "website_image_size_combo"):
+            self._on_website_image_size_changed()
 
     def _save_settings(self) -> None:
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -834,6 +1317,7 @@ class MainWindow(QMainWindow):
             "image_alignment": alignment,
             "image_display_size": display_size,
             "image_custom_width": custom_width,
+            "publish_now": self.publish_now_check.isChecked(),
         }
         self.settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         self._log("Đã lưu cấu hình không gồm password")
@@ -850,12 +1334,83 @@ class MainWindow(QMainWindow):
     def quit_application(self) -> None:
         self._quitting = True
         self.scheduler.stop()
+        self.tray_icon.hide()
         QApplication.instance().quit()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._quitting:
             event.accept()
             return
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Đóng ứng dụng")
+        dialog.setIcon(QMessageBox.Question)
+        dialog.setText("Bạn muốn tắt hoàn toàn hay thu gọn cửa sổ để app tiếp tục chạy ngầm?")
+        minimize_button = dialog.addButton("Thu gọn chạy ngầm", QMessageBox.AcceptRole)
+        quit_button = dialog.addButton("Tắt hoàn toàn", QMessageBox.DestructiveRole)
+        cancel_button = dialog.addButton("Hủy", QMessageBox.RejectRole)
+        dialog.setDefaultButton(minimize_button)
+        dialog.exec()
+
+        clicked_button = dialog.clickedButton()
+        if clicked_button == quit_button:
+            self._quitting = True
+            self.scheduler.stop()
+            self.tray_icon.hide()
+            event.accept()
+            QApplication.instance().quit()
+            return
+
+        if clicked_button == minimize_button:
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(APP_NAME, "Ứng dụng vẫn chạy ngầm ở khay hệ thống")
+            return
+
+        if clicked_button == cancel_button:
+            event.ignore()
+            return
+
         event.ignore()
-        self.hide()
-        self.tray_icon.showMessage(APP_NAME, "Ứng dụng vẫn chạy ở khay hệ thống")
+
+
+def _website_payload_id(payload: object) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return int(payload.get("id"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _website_payload_title(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    title = payload.get("title")
+    value = ""
+    if isinstance(title, dict):
+        value = str(title.get("raw") or title.get("rendered") or "")
+    elif isinstance(title, str):
+        value = title
+    return html.unescape(re.sub(r"<[^>]+>", "", value)).strip()
+
+
+def _website_payload_status(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    status = payload.get("status")
+    return str(status or "")
+
+
+def _website_payload_slug(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    slug = payload.get("slug")
+    return str(slug or "")
+
+
+def _website_payload_link(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    link = payload.get("link")
+    return str(link or "")

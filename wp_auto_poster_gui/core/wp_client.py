@@ -98,6 +98,67 @@ class WordPressClient:
                 return post
         return None
 
+    def find_post_by_slug(self, slug: str) -> dict[str, Any] | None:
+        normalized = _normalize_slug(slug)
+        if not normalized:
+            return None
+        response = self._request("GET", "posts", params={"slug": normalized, "per_page": 1})
+        posts = response.json()
+        return posts[0] if posts else None
+
+    def get_post(self, post_id: int) -> dict[str, Any]:
+        try:
+            return self._request("GET", f"posts/{post_id}", params={"context": "edit"}).json()
+        except WordPressClientError:
+            return self._request("GET", f"posts/{post_id}").json()
+
+    def list_posts(
+        self,
+        statuses: list[str] | None = None,
+        per_page: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return editable WordPress posts across common statuses."""
+
+        target_statuses = statuses or ["publish", "draft", "pending", "future", "private"]
+        page_size = max(1, min(int(per_page), 100))
+        posts_by_id: dict[int, dict[str, Any]] = {}
+
+        for status in target_statuses:
+            page = 1
+            while True:
+                response = self._request(
+                    "GET",
+                    "posts",
+                    params={
+                        "context": "edit",
+                        "status": status,
+                        "per_page": page_size,
+                        "page": page,
+                        "orderby": "date",
+                        "order": "desc",
+                    },
+                )
+                total_pages = _response_total_pages(response)
+                batch = response.json()
+                if not isinstance(batch, list) or not batch:
+                    break
+
+                for item in batch:
+                    if isinstance(item, dict) and item.get("id") is not None:
+                        posts_by_id[int(item["id"])] = item
+
+                if total_pages is not None and page >= total_pages:
+                    break
+                if len(batch) < page_size:
+                    break
+                page += 1
+
+        return sorted(
+            posts_by_id.values(),
+            key=lambda payload: str(payload.get("date") or payload.get("modified") or ""),
+            reverse=True,
+        )
+
     def check_duplicate_by_title(self, title: str) -> bool:
         return self.find_post_by_title(title) is not None
 
@@ -129,6 +190,28 @@ class WordPressClient:
         for attempt in range(1, self.config.retry_count + 1):
             try:
                 return self._request("POST", f"posts/{post_id}", json=payload).json()
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.config.retry_count:
+                    time.sleep(min(2 * attempt, 10))
+        raise WordPressClientError(str(last_error))
+
+    def update_post_content(self, post_id: int, content: str) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(1, self.config.retry_count + 1):
+            try:
+                return self._request("POST", f"posts/{post_id}", json={"content": content}).json()
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.config.retry_count:
+                    time.sleep(min(2 * attempt, 10))
+        raise WordPressClientError(str(last_error))
+
+    def update_post_status(self, post_id: int, status: str = "publish") -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(1, self.config.retry_count + 1):
+            try:
+                return self._request("POST", f"posts/{post_id}", json={"status": status}).json()
             except Exception as exc:
                 last_error = exc
                 if attempt < self.config.retry_count:
@@ -201,6 +284,22 @@ def _strip_html(value: str) -> str:
     import re
 
     return re.sub(r"<[^>]+>", "", value)
+
+
+def _normalize_slug(value: str) -> str:
+    text = value.strip().split("?", 1)[0].split("#", 1)[0]
+    if "://" in text:
+        text = text.rstrip("/").rsplit("/", 1)[-1]
+    return text.strip("/")
+
+
+def _response_total_pages(response: object) -> int | None:
+    headers = getattr(response, "headers", {}) or {}
+    value = headers.get("X-WP-TotalPages") or headers.get("x-wp-totalpages")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _rank_math_meta(post: Post) -> dict[str, str]:

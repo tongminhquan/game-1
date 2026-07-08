@@ -7,6 +7,10 @@ venv/
 env/
 build/
 dist/
+build_*/
+dist_*/
+release/
+docs/~$*.docx
 config/settings.json
 config/schedule.json
 config/run_history.json

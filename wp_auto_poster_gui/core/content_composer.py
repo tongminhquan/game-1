@@ -13,6 +13,9 @@ _BLOCK_TAG_RE = re.compile(
 
 _P_TAG_RE = re.compile(r"(<p\b[^>]*>.*?</p>)", re.IGNORECASE | re.DOTALL)
 _IMG_SRC_RE = re.compile(r'(<img\b[^>]*?\bsrc=["\'])([^"\']+)(["\'][^>]*>)', re.IGNORECASE)
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE | re.DOTALL)
+_FIGURE_OPEN_RE = re.compile(r"<figure\b[^>]*>", re.IGNORECASE | re.DOTALL)
+_ALIGN_CLASSES = {"aligncenter", "alignleft", "alignright", "alignnone"}
 
 
 def _image_html(
@@ -148,3 +151,94 @@ def compose_content_with_images(
 
     separator = "" if mode == "html" else "\n\n"
     return separator.join(output)
+
+
+def rewrite_existing_image_layout(
+    content: str,
+    alignment: str = "aligncenter",
+    display_size: str = "auto",
+    custom_width: int = 800,
+) -> str:
+    """Rewrite alignment and size attributes on existing image markup."""
+
+    normalized_alignment = alignment if alignment in _ALIGN_CLASSES else "aligncenter"
+
+    def rewrite_img(match: re.Match[str]) -> str:
+        return _apply_image_attrs(match.group(0), normalized_alignment, display_size, custom_width)
+
+    def rewrite_figure(match: re.Match[str]) -> str:
+        tag = match.group(0)
+        class_value = _get_attr(tag, "class")
+        if not class_value:
+            return tag
+        classes = class_value.split()
+        if "wp-block-image" not in classes and not any(item in _ALIGN_CLASSES for item in classes):
+            return tag
+        return _set_attr(tag, "class", _with_alignment(class_value, normalized_alignment))
+
+    content = _FIGURE_OPEN_RE.sub(rewrite_figure, content)
+    return _IMG_TAG_RE.sub(rewrite_img, content)
+
+
+def _apply_image_attrs(tag: str, alignment: str, display_size: str, custom_width: int) -> str:
+    tag = _set_attr(tag, "class", _with_alignment(_get_attr(tag, "class") or "", alignment))
+    tag = _remove_attr(tag, "width")
+    tag = _remove_attr(tag, "height")
+    tag = _set_image_style(tag, display_size)
+
+    width: int | None = None
+    if display_size == "custom":
+        width = custom_width
+    elif display_size not in {"auto", "full"}:
+        width = IMAGE_SIZE_WIDTH.get(display_size)
+    if width:
+        tag = _set_attr(tag, "width", str(width))
+    return tag
+
+
+def _with_alignment(class_value: str, alignment: str) -> str:
+    classes = [item for item in class_value.split() if item not in _ALIGN_CLASSES]
+    classes.append(alignment)
+    return " ".join(classes)
+
+
+def _set_image_style(tag: str, display_size: str) -> str:
+    style = _get_attr(tag, "style") or ""
+    declarations: list[str] = []
+    for item in style.split(";"):
+        if not item.strip() or ":" not in item:
+            continue
+        name, value = item.split(":", 1)
+        if name.strip().lower() in {"width", "height"}:
+            continue
+        declarations.append(f"{name.strip()}:{value.strip()}")
+
+    if display_size == "full":
+        declarations.extend(["width:100%", "height:auto"])
+
+    if declarations:
+        return _set_attr(tag, "style", ";".join(declarations))
+    return _remove_attr(tag, "style")
+
+
+def _get_attr(tag: str, name: str) -> str | None:
+    match = re.search(rf"""\s{name}\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))""", tag, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    return next(group for group in match.groups()[1:] if group is not None)
+
+
+def _set_attr(tag: str, name: str, value: str) -> str:
+    escaped = html.escape(value, quote=True)
+    pattern = re.compile(rf"""\s{name}\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))""", re.IGNORECASE | re.DOTALL)
+    replacement = f' {name}="{escaped}"'
+    if pattern.search(tag):
+        return pattern.sub(replacement, tag, count=1)
+    insert_at = tag.rfind("/>") if tag.rstrip().endswith("/>") else tag.rfind(">")
+    if insert_at < 0:
+        return tag
+    return tag[:insert_at].rstrip() + replacement + tag[insert_at:]
+
+
+def _remove_attr(tag: str, name: str) -> str:
+    return re.sub(rf"""\s{name}\s*=\s*("([^"]*)"|'([^']*)'|[^\s>]+)""", "", tag, flags=re.IGNORECASE | re.DOTALL)

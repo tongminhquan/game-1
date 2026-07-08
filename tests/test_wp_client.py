@@ -23,10 +23,35 @@ class PayloadClient(WordPressClient):
         except RuntimeError:
             raise unittest.SkipTest("requests is not installed")
         self.last_payload = None
+        self.last_path = None
 
     def _request(self, method: str, path: str, **kwargs):
         self.last_payload = kwargs.get("json")
+        self.last_path = path
         return _FakeResponse({"link": "https://example.com/post"})
+
+
+class ListPostsClient(WordPressClient):
+    def __init__(self):
+        self.calls = []
+
+    def _request(self, method: str, path: str, **kwargs):
+        self.calls.append((method, path, kwargs.get("params", {})))
+        params = kwargs.get("params", {})
+        status = params.get("status")
+        page = params.get("page")
+        payloads = {
+            ("publish", 1): [
+                {"id": 2, "title": {"rendered": "Published"}, "status": "publish", "date": "2026-07-01T00:00:00"},
+            ],
+            ("publish", 2): [
+                {"id": 3, "title": {"rendered": "Newer"}, "status": "publish", "date": "2026-07-03T00:00:00"},
+            ],
+            ("draft", 1): [
+                {"id": 1, "title": {"rendered": "Draft"}, "status": "draft", "date": "2026-07-02T00:00:00"},
+            ],
+        }
+        return _FakeResponse(payloads.get((status, page), []))
 
 
 class WordPressClientTest(unittest.TestCase):
@@ -95,6 +120,31 @@ class WordPressClientTest(unittest.TestCase):
         self.assertEqual(client.last_payload["meta"]["rank_math_title"], "Title")
         self.assertEqual(client.last_payload["meta"]["rank_math_description"], "Meta description")
         self.assertEqual(client.last_payload["meta"]["rank_math_focus_keyword"], "keyword")
+
+    def test_update_post_content_only_sends_only_content(self) -> None:
+        client = PayloadClient()
+
+        client.update_post_content(123, '<p><img src="https://example.com/image.jpg" /></p>')
+
+        self.assertEqual(client.last_path, "posts/123")
+        self.assertEqual(client.last_payload, {"content": '<p><img src="https://example.com/image.jpg" /></p>'})
+
+    def test_update_post_status_only_sends_only_status(self) -> None:
+        client = PayloadClient()
+
+        client.update_post_status(123, "publish")
+
+        self.assertEqual(client.last_path, "posts/123")
+        self.assertEqual(client.last_payload, {"status": "publish"})
+
+    def test_list_posts_fetches_common_statuses_with_pagination(self) -> None:
+        client = ListPostsClient()
+
+        posts = client.list_posts(per_page=1)
+
+        self.assertEqual([post["id"] for post in posts], [3, 1, 2])
+        self.assertIn(("GET", "posts", {"context": "edit", "status": "draft", "per_page": 1, "page": 1, "orderby": "date", "order": "desc"}), client.calls)
+        self.assertIn(("GET", "posts", {"context": "edit", "status": "private", "per_page": 1, "page": 1, "orderby": "date", "order": "desc"}), client.calls)
 
 
 if __name__ == "__main__":

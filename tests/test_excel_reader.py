@@ -49,6 +49,31 @@ class ExcelReaderTest(unittest.TestCase):
         self.assertEqual(posts[0].tags, [])
         self.assertEqual(posts[0].focus_keywords, ["thang máy gia đình", "thang máy kính", "thang máy mini"])
 
+    def test_uses_slug_as_image_code_when_ma_bai_is_missing(self) -> None:
+        try:
+            import pandas as pd
+        except ImportError:
+            self.skipTest("pandas is not installed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            workbook = Path(directory) / "seo.xlsx"
+            pd.DataFrame(
+                [
+                    {
+                        "Tiêu đề SEO": "Xịt Côn Trùng",
+                        "Nội dung HTML": "<p>Nội dung</p>",
+                        "Slug": "/xit-con-trung/",
+                        "Mô tả": "Mô tả SEO",
+                    }
+                ]
+            ).to_excel(workbook, sheet_name="30 Bài SEO HTML", index=False)
+
+            posts = read_posts_from_excel(workbook)
+
+        self.assertEqual(posts[0].slug, "/xit-con-trung/")
+        self.assertEqual(posts[0].ma_bai, "xit-con-trung")
+        self.assertEqual(posts[0].meta_description, "Mô tả SEO")
+
 
 if __name__ == "__main__":
     unittest.main()
